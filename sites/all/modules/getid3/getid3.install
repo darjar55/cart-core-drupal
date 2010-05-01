@@ -1,0 +1,32 @@
+<?php
+// $Id: getid3.install,v 1.3 2007/09/11 19:16:16 robloach Exp $
+
+/**
+ * Implementation of hook_enable()
+ */ 
+function getid3_enable() {
+  // Display a message if it fails to load getID3().
+  getid3_load();
+}
+
+/**
+ * Implementation of hook_install().
+ */
+function getid3_install() {
+  $status = array();
+   // Set module weight for the getID3 module
+  $status[] = db_query("UPDATE {system} SET weight = -10 WHERE name = 'getid3'");
+
+  // If there is one FALSE value in the status array, there was an error.
+  if (array_search(FALSE, $status) !== FALSE) {
+    drupal_set_message(t('Setting the module weight of getID3 failed.'), 'error');
+  }
+}
+
+/**
+ * Implementation of hook_uninstall()
+ */ 
+function getid3_uninstall() {
+  db_query("DELETE FROM {variable} WHERE name LIKE 'getid3_%'");
+  cache_clear_all('variables', 'cache');
+}

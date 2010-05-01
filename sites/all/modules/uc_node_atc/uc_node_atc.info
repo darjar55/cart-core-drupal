@@ -1,0 +1,5 @@
+; $Id$
+name = Node Add To Cart
+description = Allows a node to be added to a uc cart with price, quantity, and description fields mapped.
+dependencies = uc_cart
+package = Ubercart - extra

@@ -1,0 +1,247 @@
+<?php
+// $Id$
+
+/**
+ * @file
+ * Allows non-product nodes to be mapped to products and added
+ * to an Ubercart shopping cart.
+ *
+ * Coded by Chris Yu.
+ */
+
+/**
+ * Implementation of hook_perm().
+ */
+function uc_node_atc_perm() {
+  return array('administer node to product');
+}
+
+/**
+ * Implementation of hook_menu().
+ */
+function uc_node_atc_menu($may_cache) {
+  $items = array();
+  if ($may_cache) {
+    $items[] = array(
+      'path' => 'admin/store/settings/node_atc',
+      'title' => t('Node to Product Settings'),
+      'description' => t('Administer relationships between content types and product types.'),
+      'access' => user_access('administer store'),
+      'callback' => '_uc_node_atc_admin',
+      'type' => MENU_NORMAL_ITEM,
+    );
+  }
+  else {
+    $items[] = array('path' => 'admin/store/settings/node_atc/'. arg(4) .'/edit',
+      'title' => t('Edit content type mapping'),
+      'access' => user_access('administer store'),
+      'callback' => 'drupal_get_form',
+      'callback arguments' => array('uc_node_atc_form', arg(4)),
+      'type' => MENU_CALLBACK,
+    );
+    $items[] = array('path' => 'admin/store/settings/node_atc/'. arg(4) .'/mapping',
+      'title' => t('Edit field mapping'),
+      'access' => user_access('administer store'),
+      'callback' => 'drupal_get_form',
+      'callback arguments' => array('uc_node_atc_map_form', arg(4)),
+      'type' => MENU_CALLBACK,
+    );
+    $items[] = array('path' => 'admin/store/settings/node_atc/'. arg(4) .'/delete',
+      'access' => user_access('administer store'),
+      'callback' => 'uc_node_atc_delete',
+      'callback arguments' => arg(4),
+      'type' => MENU_CALLBACK,
+    );
+  }
+  return $items;
+}
+
+/*
+ * Implementation of hook_action_info()
+ */
+function uc_node_atc_action_info() {
+  return array(
+    'uc_node_atc_action_add' => array(
+      '#label' => t('Add the node to the cart'),
+      '#arguments' => array(
+        'node' => array('#entity' => 'node', '#label' => t('Content')),
+      ),
+      '#module' => t('UC Node ATC'),
+    ),
+  );
+}
+
+function uc_node_atc_cart_item($op, &$item) {
+  switch($op) {
+    case 'load':
+      if($item->data['converted']) {
+        $item->module = 'uc_product';
+        $item->data['module'] = 'uc_product';
+        $item->price = $item->data['sell_price'];
+        $item->title = $item->data['product_title'];
+      }
+      break;
+  }
+}
+
+function uc_node_atc_form_alter($form_id, &$form) {
+   if($form_id == 'uc_cart_view_form') {
+    foreach($form['items'] as $key => $item) {
+      if(!empty($item['title']['#value'])) {
+        $vals = unserialize($item['data']['#value']);
+        if(!empty($vals['parent_node'])){
+          $form['items'][$key]['title']['#value'] = "<a href='node/". $vals['parent_node'] ."'>". $vals['product_title'] ."</a>";
+        }
+      }
+    }
+  }
+}
+
+function uc_node_atc_action_add($content_node) {
+  $map = db_fetch_object(db_query("SELECT maid, content_type, product_node, map_title, map_qty, map_price FROM {uc_node_atc} where content_type = '%s'", $content_node->type));
+  $map_qty = $map->map_qty;
+  $map_price = $map->map_price;
+  $map_title = $map->map_title;
+
+  $node_price = $content_node->$map_price;
+  $node_title = $content_node->$map_title;
+  $quantity = $content_node->$map_qty;
+
+  $data = array();
+  $data['sell_price'] = $node_price[0]['value'];
+  $data['parent_node'] = $content_node->nid;
+  $data['product_title'] = $node_title[0]['value'];
+  $data['module'] = 'uc_product';
+  $data['converted'] = true;
+
+  uc_cart_add_item($map->product_node, intval($quantity['0']['value']), $data);
+  $node_id = $node->nid;
+}
+
+function _uc_node_atc_admin() {
+  $result = db_query("SELECT maid, content_type, product_node FROM {uc_node_atc} ORDER BY content_type, product_node");
+  $header = array(t('Content Type'), t('Product Node'));
+  $rows = array();
+  while($attr = db_fetch_object($result)){
+    $product_node = node_load($attr->product_node);
+    $rows[] = array(l($attr->content_type, 'admin/store/settings/node_atc/'. $attr->maid .'/mapping'), $product_node->title, l(t('edit'), 'admin/store/settings/node_atc/'. $attr->maid .'/edit'), l(t('delete'), 'admin/store/settings/node_atc/'. $attr->maid .'/delete'));
+  }
+  if (count($rows) == 0){
+    $rows[] = array(array('data' => t('No node to product mappings have been defined yet.'), 'colspan' => '6'));
+  }
+  $output = theme('table', $header, $rows);
+  $output .= '<h2>'. t('Add a Mapping') .'</h2>';
+  $output .= drupal_get_form('uc_node_atc_form');
+
+  return $output;
+}
+
+function uc_node_atc_map_form($m_id = null){
+  $result = db_fetch_object(db_query("SELECT maid, content_type, product_node, map_title, map_qty, map_price FROM {uc_node_atc} where maid = %d", $m_id));
+  $field_options = array();
+  if(!empty($result)) {
+    $content_info = content_types($result->content_type);
+    foreach($content_info['fields'] as $key => $val) {
+      $field_options[$key] = $key;
+    }
+    if ($m_id){
+      $form['maid'] = array('#type' => 'hidden', '#value' => $m_id);
+    }
+    $form['map_title'] = array(
+      '#type' => 'select',
+      '#title' => t('Field to map to title'),
+      '#default_value' => !empty($result->map_title) ? $result->map_title:'',
+      '#options' => $field_options,
+    );
+    $form['map_price'] = array(
+      '#type' => 'select',
+      '#title' => t('Field to map to price'),
+      '#default_value' => !empty($result->map_price) ? $result->map_price:'',
+      '#options' => $field_options,
+    );
+    $form['map_qty'] = array(
+      '#type' => 'select',
+      '#title' => t('Field to map to quantity'),
+      '#default_value' => !empty($result->map_qty) ? $result->map_qty:'',
+      '#options' => $field_options,
+    );
+    $form['submit'] = array('#type' => 'submit',
+      '#value' => t('Save'),
+      '#weight' => 2,
+    );
+  }
+
+  return $form;
+}
+
+function uc_node_atc_map_form_submit($form_id, $form_values){
+  if(!empty($form_values['maid'])) {
+    db_query("UPDATE {uc_node_atc} set map_title = '%s', map_price = '%s', map_qty = '%s' where maid = %d", $form_values['map_title'], $form_values['map_price'], $form_values['map_qty'], $form_values['maid']);
+  }
+  return 'admin/store/settings/node_atc';
+}
+
+function uc_node_atc_form($m_id = null){
+  $content_types = content_types();
+  $product_types = array();
+  $nonproduct_types = array();
+  $product_nodes = array();
+  foreach ($content_types as $key => $ct) {
+    if ($ct['module'] == 'uc_product') {
+      $product_types[$ct['type']] = $ct['type'];
+      $result = db_query("SELECT nid, title FROM {node} where type='%s' ORDER BY title", $ct['type']);
+      while($nodes = db_fetch_object($result)){
+        $product_nodes[$nodes->nid] = $nodes->title;
+      }
+    }
+    else {
+      $nonproduct_types[$ct['type']] = $ct['type'];
+    }
+  }
+
+  $map = uc_node_atc_load($m_id);
+
+  $form['content_type'] = array(
+    '#type' => 'select',
+    '#title' => t('Content Type'),
+    '#default_value' => $map->content_type,
+    '#options' => $nonproduct_types,
+  );
+
+  $form['product_node'] = array(
+    '#type' => 'select',
+    '#title' => t('Product'),
+    '#default_value' => $map->product_node,
+    '#options' => $product_nodes,
+  );
+
+  $form['op'] = array('#type' => 'submit',
+    '#value' => t('Submit'),
+    '#weight' => 2,
+  );
+
+  return $form;
+}
+
+/**
+ * Submit function for uc_node_atc_form().
+ */
+function uc_node_atc_form_submit($form_id, $form_values){
+  if(!isset($form_values['maid'])) {
+    db_query("INSERT INTO {uc_node_atc} (content_type, product_node) VALUES ('%s', %d)", $form_values['content_type'], $form_values['product_node']);
+  }
+  else {
+    db_query("UPDATE {uc_node_atc} set content_type = '%s', product_node = %d where maid = %d", $form_values['content_type'], $form_values['product_node'], $form_values['maid']);
+  }
+  return 'admin/store/settings/node_atc';
+}
+
+function uc_node_atc_delete($maid){
+  db_query("delete from {uc_node_atc} where maid = %d", $maid);
+  drupal_goto('admin/store/settings/node_atc');
+}
+
+function uc_node_atc_load($m_id){
+  $map = db_fetch_object(db_query("SELECT * FROM {uc_node_atc} WHERE maid = %d", $m_id));
+  return $map;
+}

@@ -1,0 +1,23 @@
+<?php
+// $Id$
+
+function uc_node_atc_install() {
+  switch ($GLOBALS['db_type']) {
+    case 'mysql':
+    case 'mysqli':
+      db_query("CREATE TABLE {uc_node_atc} (
+        maid mediumint(9) NOT NULL auto_increment,
+        content_type varchar(100) NOT NULL,
+        product_node int(10) NOT NULL,
+        map_title varchar(255) NOT NULL,
+        map_qty varchar(255) NOT NULL,
+        map_price varchar(255) NOT NULL,
+        PRIMARY KEY (maid)
+      ) /*!40100 DEFAULT CHARACTER SET UTF8 */ ");
+      break;
+  }
+}
+
+function uc_node_atc_uninstall() {
+  db_query("DROP TABLE IF EXISTS {uc_node_atc}");
+}

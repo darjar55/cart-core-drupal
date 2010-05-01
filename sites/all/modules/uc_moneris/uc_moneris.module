@@ -1,0 +1,462 @@
+<?php
+/**
+ * @file
+ * A module used for Moneris.com payment gateway.
+ *
+ * Based on the authorize.net payment gateway for uberbart
+ * Developed by Gord Christmas (http://www.northStudio.com | codexmas@gmail.com)
+ * Development Sponsored by northStudio.com (http://www.northStudio.com)
+ *
+ */
+/**
+ * Implementation of hook_menu().
+ */
+function uc_moneris_menu($may_cache) {
+  $items = array();
+  if (!$may_cache) {
+    $items[] = array(
+      'path' => 'cart/checkout/mpi',
+      'title' => t('Verified By VISA/Mastercard SecureCode'),
+      'callback' => 'uc_moneris_mpi_check',
+      'access' => user_access('access content'),
+      'type' => MENU_CALLBACK,
+    );
+    $items[] = array(
+      'path' => 'cart/checkout/mpi/complete',
+      'title' => t('Verified By VISA/Mastercard SecureCode'),
+      'callback' => 'uc_moneris_mpi_complete',
+      'access' => user_access('access content'),
+      'type' => MENU_CALLBACK,
+    );
+  }
+
+  return $items;
+}
+
+/**
+* @desc Make a change to the review order form so that we can insert our own VBV process if needed.
+*/
+function uc_moneris_form_alter($form_id, &$form){
+  if($form_id == 'uc_cart_checkout_form'){
+    // Clear the uc_moneris info at checkout stage
+    $_SESSION['uc_moneris'] = null;
+    unset($_SESSION['uc_moneris']);
+  }
+  // Only alter the form if VBV is enabled
+  if(variable_get('moneris_vbv_enable', 'disabled') == 'enabled'){
+    if($form_id == 'uc_cart_checkout_review_form'){
+      $order = uc_order_load($_SESSION['cart_order']);
+      // Only add the override to the review form if it is a Visa and we haven't got any uc_moneris data in the session.
+      if($order->payment_details['cc_type'] == 'Visa' AND $_SESSION['uc_moneris']['cart_order'] != $order->order_id){
+        $presubmit = array('uc_moneris_checkout_review_form_submit' => array());
+        // Add an additional form submission call so that we can process Visa cards
+        //$form['#submit'] = array_merge($presubmit, $form['#submit']);
+        $form['#submit'] = $presubmit;
+      }
+    }
+  }
+}
+
+/**
+* @desc Initial check for all Visa cards so that we can determine if they are enrolled or not in VBV
+*/
+function uc_moneris_mpi_check($order_id, $status = false){
+  $order = uc_order_load($order_id);
+  // Use the MonthDayHoursMinutesSeconds as the unique prefix
+  $xid = date("mdHis", $order->created).str_pad($order->order_id, 10, '0', STR_PAD_LEFT);    // Must be 20 Alpha/Numeric Chars exactly
+  // Expiry has to be in YYMM format
+  $expiry = $order->payment_details['cc_exp_year'][2].
+            $order->payment_details['cc_exp_year'][3].
+            str_pad($order->payment_details['cc_exp_month'], 2, 0, STR_PAD_LEFT);
+    
+  // VBV Checking
+  if($order->payment_details['cc_type'] == 'Visa'){
+    require_once(drupal_get_path('module', 'uc_moneris').'/api/mpiClasses.php');
+    // Determine if the VISA is enrolled
+    $store_id   = variable_get('moneris_store_id', '');
+    $api_token  = variable_get('moneris_api_token', '');
+
+    $merchUrl = url('cart/checkout/mpi/complete', null, null, true); // Where to collect
+    
+    // If we are not in test mode, we have to craft the return url so that it remains secure
+    if(variable_get('moneris_transaction_mode', 'test') != 'test'){
+      $merchUrl = str_replace('http://', 'https://', $merchUrl);
+    }
+    
+    $HTTP_ACCEPT = getenv("HTTP_ACCEPT"); 
+    $HTTP_USER_AGENT = getenv("HTTP_USER_AGENT");
+      
+    $txnArray = array(
+      'type'        => 'txn',
+      'xid'         => $xid,
+      'amount'      => $order->order_total,
+      'pan'         => $order->payment_details['cc_number'],
+      'expdate'     => $expiry,
+      'MD'          => "xid=" . $xid           //MD is merchant data that can be passed along
+        ."&amp;order_id=" . $order->order_id
+        ."&amp;pan=" . $order->payment_details['cc_number']
+        ."&amp;expiry=".$expiry
+        ."&amp;amount=" .$order->order_total,
+      'merchantUrl' => $merchUrl,
+      'accept'      => $HTTP_ACCEPT,
+      'userAgent'   => $HTTP_USER_AGENT
+    );
+
+    $mpiTxn       = new MpiTransaction($txnArray);
+    $mpiRequest   = new MpiRequest($mpiTxn);
+    $mpiHttpPost  = new MpiHttpsPost($store_id,$api_token,$mpiRequest);
+    $mpiResponse  = $mpiHttpPost->getMpiResponse();
+    
+    if($mpiResponse->getMpiMessage() == 'Y'){
+      $vbvInLineForm = $mpiResponse->getMpiInLineForm();
+      // Send the inline JS form
+      $output = $vbvInLineForm."\n";
+    }
+    else {
+      // Strict mode
+      if(variable_get('moneris_vbv_strict', 'disabled') == 'enabled'){
+        drupal_set_message('All VISA Purchases must be enrolled in the VBV (Verified by VISA) protection system.');
+        drupal_goto('cart/checkout');
+        exit;
+      }
+      // Standard mode
+      else{
+        if ($mpiResponse->getMpiMessage() == 'U'){
+          // merchant assumes liability for charge back (usually corporate cards)
+          $output = '7';
+        }
+        else {
+          // merchant is not liable for chargeback (attempt was made)
+          $output = '6';
+        }
+      }
+    }
+  }
+  return $output;
+}
+
+// Override the review form submit so we can re-submit after Javascript
+function uc_moneris_checkout_review_form_submit($form_id, &$form_values) {
+  // Clear the temp data each time we are going to attempt communincate
+  $_SESSION['uc_moneris'] = null;
+  switch ($form_values['op']) {
+    case variable_get('uc_checkout_submit_button', t('Submit order')):
+      $_SESSION['uc_moneris']['post'] = $_POST;
+      $_SESSION['uc_moneris']['form_id'] = $form_id;
+      $_SESSION['uc_moneris']['form_values'] = $form_values;
+      $order = uc_order_load($_SESSION['cart_order']);
+      if($order->payment_details['cc_type'] == 'Visa'){
+        // Determine if the VISA is enrolled in VBV
+        $response = uc_moneris_mpi_check($order->order_id);
+        if($response == '6' OR $response == '7'){
+          $_SESSION['uc_moneris']['crypt_type'] = $response;
+        }
+        else{
+          // Print out the JS inline form and exit
+          print $response;
+          exit;
+        }
+      }
+      else{
+        // Pass the transaction on as a normal credit card purchase
+        return uc_cart_checkout_review_form_submit($form_id, $form_values);
+      }
+  }
+  uc_moneris_mpi_complete();
+} 
+
+/**
+* @desc Location that we are returned to after the inline JS form has been submitted 
+*/
+function uc_moneris_mpi_complete(){
+  global $form_values;
+  if($_POST['MD']){
+    parse_str($_POST['MD'], $md);
+    dpm($md, 'complete - md');
+    // Save the post vars that came from the Moneris MPI call
+    $_SESSION['uc_moneris'][$md['order_id']] = $_POST;
+    $_SESSION['uc_moneris']['cart_order'] = $_SESSION['cart_order'];
+  }
+  // Re-instate the post vars as they were at the start  
+  $_POST        = $_SESSION['uc_moneris']['post'];
+  $form_values  = $_SESSION['uc_moneris']['form_values'];
+  $form_values['op'] = variable_get('uc_checkout_submit_button', t('Submit order'));
+  
+  $result = uc_cart_checkout_review_form_submit('uc_cart_checkout_review_form_submit', $form_values);
+  
+  // Success?
+  if($result == 'cart/checkout/complete'){
+    $_SESSION['do_complete'] = TRUE;
+    $_REQUEST['destination'] = 'cart/checkout/complete';
+  }
+  else{
+    // There was an issue
+    $_SESSION['do_review'] = TRUE;
+    $_REQUEST['destination'] = 'cart/checkout/review';
+  }
+  
+  // Now send them on their way...
+  drupal_goto();
+}
+ 
+/*******************************************************************************
+ * Hook Functions (Ubercart)
+ ******************************************************************************/
+
+function uc_moneris_payment_gateway() {
+  $gateways[] = array(
+    'id' => 'moneris',
+    'title' => t('Moneris.com'),
+    'description' => t('Process credit card payments using the API service of Moneris.com.'),
+    'settings' => 'uc_moneris_settings_form',
+    'credit' => 'uc_moneris_charge',
+  );
+  return $gateways;
+}
+
+/*******************************************************************************
+ * Callback Functions, Forms, and Tables
+ ******************************************************************************/
+
+/**
+ * Callback for payment gateway settings.
+ */
+function uc_moneris_settings_form() {
+  $form['moneris_settings'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Moneris.com settings'),
+  );
+  $form['moneris_settings']['moneris_store_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Store ID'),
+    '#default_value' => variable_get('moneris_store_id', ''),
+    '#description' => t('The Store ID used for the Moneris.com service.'),
+  );
+  $form['moneris_settings']['moneris_api_token'] = array(
+    '#type' => 'textfield',
+    '#title' => t('API Token'),
+    '#default_value' => variable_get('moneris_api_token', ''),
+    '#description' => t('Your API Token key for sending data.'),
+  );
+  $form['moneris_settings']['moneris_transaction_type'] = array(
+    '#type' => 'select',
+    '#title' => t('Transaction type to use'),
+    '#options' => array('purchase' => 'Purchase', 'preauth' => 'PreAuth'),
+    '#default_value' => variable_get('moneris_transaction_type', 'purchase'),
+    '#description' => t('Use purchase to charge the card immediately after authentication. Use PreAuth to lock the funds at authentication time and then Capture the funds at a later time.'),
+  );
+  
+  $form['moneris_settings']['moneris_vbv_enable'] = array(
+    '#type' => 'select',
+    '#title' => t('Enable VBV (Verified by VISA)'),
+    '#options' => array('disabled' => 'Disabled', 'enabled' => 'Enabled'),
+    '#default_value' => variable_get('moneris_vbv_enable', 'disabled'),
+    '#description' => t('Allow transactions to authenticate through the Moneris VBV system.'),
+  );
+  $form['moneris_settings']['moneris_vbv_strict'] = array(
+    '#type' => 'select',
+    '#title' => t('Enable VBV Strict Mode (Not-recommended)'),
+    '#options' => array('disabled' => 'Disabled', 'enabled' => 'Enabled'),
+    '#default_value' => variable_get('moneris_vbv_strict', 'disabled'),
+    '#description' => t('Strict mode only allows VISA cards that are enrolled to complete payment, Standard mode allows no-enrolled cards to proceed as a normal purchase.'),
+  );
+  
+  $form['moneris_settings']['moneris_transaction_mode'] = array(
+    '#type' => 'select',
+    '#title' => t('Transaction mode'),
+    '#description' => t('Transaction mode used for processing orders.'),
+    '#options' => array(
+      'production' => t('Production'),
+      'test' => t('Test'),
+    ),
+    '#default_value' => variable_get('moneris_transaction_mode', 'test'),
+  );
+  
+  return $form;
+}
+
+function uc_moneris_charge($order_id, $amount, $data) {
+  global $user, $response;
+  $order = uc_order_load($order_id);
+  
+  require_once(drupal_get_path('module', 'uc_moneris').'/api/mpiClasses.php');
+  require_once drupal_get_path('module', 'uc_moneris')."/api/mpgClasses.php";
+  /**************************** Request Variables *******************************/
+  $store_id   = variable_get('moneris_store_id', '');
+  $api_token  = variable_get('moneris_api_token', '');
+  $txnType    = variable_get('moneris_transaction_type', 'purchase');
+  // Use the MonthDayHoursMinutesSeconds as the unique prefix
+  $xid = date("mdHis", $order->created).str_pad($order->order_id, 10, '0', STR_PAD_LEFT);    // Must be 20 Alpha/Numeric Chars exactly
+  
+  // Transaction via the Process button by an admin on the order form (PreAuth already happened)
+  if($order->data['TxnNumber'] AND arg(3) == $order_id AND arg(4) == 'credit'){
+    $txnType = 'completion';
+    $txn_number = $order->data['TxnNumber'];
+  }
+  $crypt_type = $_SESSION['uc_moneris']['crypt_type'] ? $_SESSION['uc_moneris']['crypt_type'] : 7; 
+  
+  if (!function_exists('curl_init')) {
+    drupal_set_message(t('The Moneris.com API service requires curl.  Please talk to your system administrator to get this configured.'));
+    return array('success' => FALSE);
+  }
+  
+  // Load the MPI Data from the inline javascript page
+  if(is_array($_SESSION['uc_moneris'][$order_id]) AND count($_SESSION['uc_moneris'][$order_id])){
+    $mpi_data = $_SESSION['uc_moneris'][$order_id];
+  }
+  
+  // Expiry has to be in YYMM format
+  $expiry = $order->payment_details['cc_exp_year'][2].
+            $order->payment_details['cc_exp_year'][3].
+            str_pad($order->payment_details['cc_exp_month'], 2, 0, STR_PAD_LEFT);
+    
+  // Check to see if this is a VBV Transaction
+  if($mpi_data){
+    // Fully authenticated
+    $crypt_type = 5;
+    $txnArray = array(
+      'type'    => 'acs',
+      'PaRes'   => $mpi_data['PaRes'],
+      'MD'      => $mpi_data['MD'],
+    );
+    $mpiTxn = new MpiTransaction($txnArray);
+    $mpiRequest = new MpiRequest($mpiTxn);
+    $mpiHttpPost  = new MpiHttpsPost($store_id,$api_token,$mpiRequest);
+    $mpiResponse=$mpiHttpPost->getMpiResponse();
+    
+    $response_values = array(
+      '!code'     => $mpiResponse->getMpiSuccess(),
+      '!response' => $mpiResponse->getMpiMessage(),
+    );
+    
+    parse_str($mpi_data['MD'], $md); //this function will parse MD field as if it were a query string
+                                //and bring the resultant variables into this scope
+    // Set the xid to match what the original ACS transaction was
+    $xid = $md['xid'];
+    
+    if( strcmp($mpiResponse->getMpiSuccess(),"true") == 0 ){
+      $cavv     = $mpiResponse->getMpiCavv();
+      $txnType  = 'cavv_'.$txnType;
+      if(!$order->data[$txnType]['mpiResponse']){
+        $order->data[$txnType]['mpiResponse'] = $mpiResponse;
+      }
+    }
+    else{
+      // There was an issue, deny transaction
+      $result = array(
+        'success' => false,
+        'comment' => t('Moneris MPI Failed: !code, Message: !response', $response_values),
+        'message' => t('Moneris MPI Failed: !code, Message: !response', $response_values),
+        'uid' => $user->uid,
+      );
+      return $result;
+    }
+  }
+
+  // This is either a PreAuth or a Purchase transaction
+  if(!$txn_number){     
+    /*********************** Transactional Associative Array **********************/
+    $txnArray = array(
+      'type'        => $txnType,
+      'order_id'    => $xid,
+      'cust_id'     => $order->uid,
+      'amount'      => number_format($amount, 2, '.', ''),
+      'pan'         => $order->payment_details['cc_number'],
+      'expdate'     => $expiry,
+      'crypt_type'  => $crypt_type,
+    );
+    // Do we have an MPI Authorized transaction?
+    if($cavv){
+      $txnArray['cavv'] = $cavv;
+    }
+    
+    /**************************** Transaction Object *****************************/
+    $mpgTxn       = new mpgTransaction($txnArray);
+    /****************************** Request Object *******************************/
+    $mpgRequest   = new mpgRequest($mpgTxn);
+    /***************************** HTTPS Post Object *****************************/
+    $mpgHttpPost  = new mpgHttpsPost($store_id, $api_token, $mpgRequest);
+    /******************************* Response ************************************/
+    $mpgResponse  = $mpgHttpPost->getMpgResponse();
+
+  }
+  // This is a Completion called by a manager/clerk after a PreAuth
+  else{
+    // Build the txnArray
+    $txnArray = array(
+      'type'        => 'completion', 
+      'txn_number'  => $txn_number, 
+      'order_id'    => $xid, 
+      'comp_amount' => number_format($amount, 2, '.', ''), 
+      'crypt_type'  => '7',
+    );
+    
+    $mpgTxn       = new mpgTransaction($txnArray); 
+    $mpgRequest   = new mpgRequest($mpgTxn); 
+    $mpgHttpPost  = new mpgHttpsPost($store_id, $api_token, $mpgRequest); 
+    $mpgResponse  = $mpgHttpPost->getMpgResponse(); 
+    
+  }
+  
+  // Fetch Response Codes
+  $response_code = $mpgResponse->getResponseCode();
+  $response_text = $mpgResponse->getMessage();
+  $approval_code = $mpgResponse->getAuthCode();
+  $txn_number    = $mpgResponse->getTxnNumber();
+  $completed     = $mpgResponse->getComplete();
+  
+  // Store TxnNumber for a Capture later
+  if(!$order->data['TxnNumber']){
+    $order->data['TxnNumber'] = $txn_number;
+  }
+  
+  // Were we Successful?
+  if (intval($response_code) > 49 OR $completed == 'false') {
+    $message = t('Credit card **!auth** declined: !amount', array('!amount' => uc_currency_format($amount), '!auth' => $txnType));
+    $result = array(
+      'success' => FALSE,
+      'comment' => t('Credit card **!auth** declined: !text', array('!text' => $response_text, '!auth' => $txnType)),
+      'message' => t('Credit card **!auth** declined: !text', array('!text' => $response_text, '!auth' => $txnType)),
+      'uid' => $user->uid,
+    );
+  }
+  else {
+    $message = t('Credit card **!auth** amount: !amount', array('!amount' => uc_currency_format($amount), '!auth' => $txnType));
+    if($txnType == 'preauth' OR $txnType == 'cavv_preauth'){
+      $preauth_ammount = '(PreAuth: '.uc_currency_format($amount).')';
+    }
+    $response_values = array(
+      '!code'           => $approval_code,
+      '!response'       => $response_code,
+      '!auth'           => $txnType,
+      '!preauth_amount' => $preauth_amount,
+    );
+    
+    $result = array(
+      'success' => TRUE,
+      'comment' => t('Credit card **!auth** processed successfully. Approval code: !code, Response Code: !response !preauth_amount', $response_values),
+      'message' => t('Credit card **!auth** processed successfully. Approval code: !code, Response Code: !response !preauth_amount', $response_values),
+      'uid' => $user->uid,
+    );
+  }
+  // Save order to preserve data
+  uc_order_save($order);
+  uc_order_comment_save($order_id, $user->uid, $message, 'admin');
+  $_SESSION['uc_moneris'] = null;
+  unset($_SESSION['uc_moneris']);
+  
+  return $result;
+} 
+
+/**
+ * Implementation of hook_order().
+ */
+function uc_moneris_order($op, $order) {
+  switch ($op) {
+    case 'load':
+      // We need to alter the preauth entries in the uc_payment_receipts to be zero to have the correct balance
+      db_query("UPDATE {uc_payment_receipts} SET amount = 0 
+        WHERE order_id = %d AND comment LIKE '%preauth**%' AND amount > 0", $order->order_id);
+      break;
+  }
+}

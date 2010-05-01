@@ -1,0 +1,5 @@
+; $Id$
+name = Moneris.com
+description = A gateway used to process payments using Moneris.com
+dependencies = uc_payment uc_credit
+package = Ubercart - payment

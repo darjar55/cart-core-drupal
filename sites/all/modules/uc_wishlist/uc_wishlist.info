@@ -1,0 +1,16 @@
+; $Id: uc_wishlist.info,v 1.1 2009/03/27 16:08:33 rszrama Exp $
+name = "Wish list/gift registry"
+description = "Allows users to create public shopping or wish lists."
+dependencies[] = uc_store
+dependencies[] = uc_order
+dependencies[] = uc_product
+package = "Ubercart - extra"
+core = 6.x
+php = 5.0
+
+; Information added by drupal.org packaging script on 2010-02-22
+version = "6.x-1.1"
+core = "6.x"
+project = "uc_wishlist"
+datestamp = "1266853824"
+
